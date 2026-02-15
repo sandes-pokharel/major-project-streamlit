@@ -3,7 +3,6 @@ import torch
 import numpy as np
 import shap
 from scipy.special import softmax
-from functools import lru_cache
 from transformers import AutoModelForSequenceClassification, AutoTokenizer
 import streamlit.components.v1 as components
 
@@ -37,7 +36,7 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
 
 # ==========================================
-# 2. SHAP WRAPPER
+# 2. SHAP WRAPPER WITH BATCH CHUNK PROCESSING
 # ==========================================
 
 class DocumentSHAPWrapper:
@@ -49,7 +48,8 @@ class DocumentSHAPWrapper:
         device,
         class_names=("Human", "AI"),
         max_length=512,
-        overlap=30
+        overlap=30,
+        batch_size=8  # NEW: Default batch size for chunk processing
     ):
 
         self.model = model.to(device)
@@ -63,6 +63,7 @@ class DocumentSHAPWrapper:
         self.max_length = min(max_length, tokenizer.model_max_length)
         self.overlap = overlap
         self.chunk_size = self.max_length - 2
+        self.batch_size = batch_size  # Store default batch size
 
         self.explainer = shap.Explainer(
             self._predict_document,
@@ -132,23 +133,16 @@ class DocumentSHAPWrapper:
         return chunks if chunks else [text]
 
 
-    @lru_cache(maxsize=256)
-    def _cached_chunk_encodings(self, text):
-
-        text = " ".join(text.split())
-
-        chunks = self._split_into_chunks(text)
-
-        return self.tokenizer(
-            chunks,
-            padding=True,
-            truncation=True,
-            max_length=self.max_length,
-            return_tensors="pt"
-        )
-
+    # ==================================================
+    # ✅ UPDATED: BATCH PROCESSING OF CHUNKS
+    # ==================================================
 
     def _predict_document(self, texts):
+        """
+        Process documents with BATCH PROCESSING of chunks.
+        Each document is split into chunks, and chunks are processed
+        in batches for better GPU utilization.
+        """
 
         all_avg_logits = []
 
@@ -164,21 +158,38 @@ class DocumentSHAPWrapper:
 
                     continue
 
-                encodings = self._cached_chunk_encodings(text)
+                # Split document into chunks
+                chunks = self._split_into_chunks(text)
+                
+                # Process chunks in batches
+                chunk_logits = []
+                
+                for i in range(0, len(chunks), self.batch_size):
+                    batch_chunks = chunks[i:i + self.batch_size]
+                    
+                    # Tokenize batch of chunks
+                    encodings = self.tokenizer(
+                        batch_chunks,
+                        padding=True,
+                        truncation=True,
+                        max_length=self.max_length,
+                        return_tensors="pt"
+                    )
+                    
+                    encodings = {
+                        k: v.to(self.device)
+                        for k, v in encodings.items()
+                    }
 
-                encodings = {
-                    k: v.to(self.device)
-                    for k, v in encodings.items()
-                }
-
-                outputs = self.model(**encodings)
-
-                logits = outputs.logits
-
-                avg_logits = torch.mean(
-                    logits,
-                    dim=0
-                ).detach().cpu().numpy()
+                    outputs = self.model(**encodings)
+                    logits = outputs.logits
+                    
+                    # Collect logits from this batch
+                    chunk_logits.append(logits.detach().cpu())
+                
+                # Concatenate all chunk logits and take mean
+                all_chunk_logits = torch.cat(chunk_logits, dim=0)
+                avg_logits = torch.mean(all_chunk_logits, dim=0).numpy()
 
                 all_avg_logits.append(avg_logits)
 
@@ -474,6 +485,16 @@ st.markdown(
     "Enter text below. The system will provide prediction and SHAP explanation."
 )
 
+# Add batch size control in sidebar
+st.sidebar.title("Settings")
+batch_size = st.sidebar.slider(
+    "Chunk Batch Size",
+    min_value=1,
+    max_value=32,
+    value=8,
+    help="Number of chunks to process simultaneously. Higher values use more GPU memory but may be faster."
+)
+
 text_input = st.text_area("Input Text", value=" ", height=200)
 
 
@@ -490,7 +511,8 @@ if st.button("Analyze", type="primary"):
         wrapper = DocumentSHAPWrapper(
             model,
             tokenizer,
-            device
+            device,
+            batch_size=batch_size  # Use user-selected batch size
         )
 
 
@@ -564,7 +586,7 @@ if st.button("Analyze", type="primary"):
             )
 
             st.info(
-                f"Tokens: {token_count} | Chunks: {num_chunks}"
+                f"Tokens: {token_count} | Chunks: {num_chunks} | Batch Size: {batch_size}"
             )
 
 
